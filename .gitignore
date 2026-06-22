@@ -4,3 +4,9 @@ __pycache__/
 *.pyc
 .idea/
 .vscode/
+chroma_db/
+.agents/
+.claude/
+.codegraph/
+config/
+skills-lock.json
