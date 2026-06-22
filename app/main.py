@@ -43,6 +43,7 @@ class ChatResponse(BaseModel):
 class AskRequest(BaseModel):
     question: str
     use_rag: bool = True
+    use_rerank: bool = True
     model: str = "deepseek-chat"
 
 class AskResponse(BaseModel):
@@ -83,7 +84,7 @@ async def ask(req: AskRequest):
 
     sources = []
     if req.use_rag:
-        context, sources = rag_query(req.question)
+        context, sources = rag_query(req.question, use_rerank=req.use_rerank)
         system_prompt = (
             "你是一个金融分析助手。请严格基于以下参考文档内容回答问题，"
             "不要编造文档中没有的信息。如果文档中没有相关信息，请明确说明。\n\n"
