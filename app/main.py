@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from app.rag import process_pdf, query as rag_query, get_stats, DATA_DIR
+from app.graph import analyze_pdf, print_graph_ascii
 
 app = FastAPI(title="金融研报多 Agent 分析系统", version="0.1.0")
 
@@ -82,6 +83,32 @@ async def upload(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, f)
     chunk_count = process_pdf(str(file_path))
     return {"filename": file.filename, "chunks": chunk_count, "status": "ok"}
+
+class AnalyzeRequest(BaseModel):
+    filename: str
+
+class AnalyzeResponse(BaseModel):
+    pdf_filename: str
+    extracted_data: dict = {}
+    risk_flags: list = []
+    risk_level: str = ""
+    final_report: str = ""
+
+
+# ── 多 Agent 分析接口 ──
+@app.post("/api/analyze", response_model=AnalyzeResponse)
+async def analyze(req: AnalyzeRequest):
+    result = analyze_pdf(req.filename)
+    if "error" in result:
+        raise HTTPException(400, detail=result["error"])
+    return result
+
+
+@app.get("/api/graph")
+async def show_graph():
+    """返回 LangGraph 可视化 ASCII 图"""
+    return {"graph_ascii": print_graph_ascii()}
+
 
 # RAG 查询接口
 @app.post("/api/askRAG", response_model=AskResponse)
