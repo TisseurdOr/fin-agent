@@ -18,8 +18,14 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # ── 模型工厂 ──
 MODELS = {
-    "deepseek-chat": ChatOpenAI(
-        model="deepseek-chat",
+    "deepseek-v4-flash": ChatOpenAI(
+        model="deepseek-v4-flash",
+        api_key=os.getenv("DEEPSEEK_API_KEY", "sk-placeholder"),
+        base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        temperature=0.3,
+    ),
+    "deepseek-v4-pro": ChatOpenAI(
+        model="deepseek-v4-pro",
         api_key=os.getenv("DEEPSEEK_API_KEY", "sk-placeholder"),
         base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         temperature=0.3,
@@ -35,7 +41,7 @@ MODELS = {
 # ── Schema ──
 class ChatRequest(BaseModel):
     message: str
-    model: str = "deepseek-chat"
+    model: str = "deepseek-v4-flash"
 
 class ChatResponse(BaseModel):
     reply: str
@@ -44,7 +50,9 @@ class AskRequest(BaseModel):
     question: str
     use_rag: bool = True
     use_rerank: bool = True
-    model: str = "deepseek-chat"
+    use_rewrite: bool = False
+    use_hyde: bool = False
+    model: str = "deepseek-v4-flash"
 
 class AskResponse(BaseModel):
     answer: str
@@ -75,16 +83,16 @@ async def upload(file: UploadFile = File(...)):
     chunk_count = process_pdf(str(file_path))
     return {"filename": file.filename, "chunks": chunk_count, "status": "ok"}
 
-
-@app.post("/api/ask", response_model=AskResponse)
-async def ask(req: AskRequest):
+# RAG 查询接口
+@app.post("/api/askRAG", response_model=AskResponse)
+async def ask_rag(req: AskRequest):
     llm = MODELS.get(req.model)
     if not llm:
         raise HTTPException(400, detail=f"不支持的模型: {req.model}")
 
     sources = []
     if req.use_rag:
-        context, sources = rag_query(req.question, use_rerank=req.use_rerank)
+        context, sources = rag_query(req.question, use_rerank=req.use_rerank, use_rewrite=req.use_rewrite, use_hyde=req.use_hyde)
         system_prompt = (
             "你是一个金融分析助手。请严格基于以下参考文档内容回答问题，"
             "不要编造文档中没有的信息。如果文档中没有相关信息，请明确说明。\n\n"
