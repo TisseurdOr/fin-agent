@@ -24,6 +24,7 @@ class LLMResult:
     """LLM 调用结果——成功或失败。调用方检查 .ok 决定后续行为。"""
     content: Optional[str] = None
     error: Optional[str] = None
+    tool_calls: Optional[list] = None  # Function Calling 的 tool_calls
 
     @property
     def ok(self) -> bool:
@@ -58,17 +59,20 @@ def call_llm(
             elapsed_ms = (time.perf_counter() - t0) * 1000
 
             content = resp.content.strip() if resp.content else ""
+            # 提取 tool_calls（如有）
+            tc = getattr(resp, "tool_calls", None) or None
             logger.info(
-                "LLM call ok | request_id=%s caller=%s model=%s duration_ms=%.0f content_len=%d attempt=%d/%d",
+                "LLM call ok | request_id=%s caller=%s model=%s duration_ms=%.0f content_len=%d tool_calls=%d attempt=%d/%d",
                 request_id or "-",
                 caller,
                 getattr(llm, "model_name", "?"),
                 elapsed_ms,
                 len(content),
+                len(tc) if tc else 0,
                 attempt + 1,
                 max_retries + 1,
             )
-            return LLMResult(content=content)
+            return LLMResult(content=content, tool_calls=tc)
 
         except Exception as e:
             last_error = e
