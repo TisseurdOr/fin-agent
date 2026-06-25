@@ -8,36 +8,19 @@ load_dotenv()
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from app.rag import process_pdf, query as rag_query, get_stats, DATA_DIR
 from app.graph import analyze_pdf, print_graph_ascii
+from app.config import get_llm, get_available_models
+from app.llm_harness import call_llm
+from app.observability import setup_logging, RequestIDMiddleware
+
+setup_logging()
 
 app = FastAPI(title="金融研报多 Agent 分析系统", version="0.1.0")
 
+app.add_middleware(RequestIDMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-# ── 模型工厂 ──
-MODELS = {
-    "deepseek-v4-flash": ChatOpenAI(
-        model="deepseek-v4-flash",
-        api_key=os.getenv("DEEPSEEK_API_KEY", "sk-placeholder"),
-        base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-        temperature=0.3,
-    ),
-    "deepseek-v4-pro": ChatOpenAI(
-        model="deepseek-v4-pro",
-        api_key=os.getenv("DEEPSEEK_API_KEY", "sk-placeholder"),
-        base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-        temperature=0.3,
-    ),
-    "qwen-plus": ChatOpenAI(
-        model="qwen-plus",
-        api_key=os.getenv("DASHSCOPE_API_KEY", "sk-placeholder"),
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        temperature=0.3,
-    ),
-}
 
 # ── Schema ──
 class ChatRequest(BaseModel):
@@ -62,15 +45,18 @@ class AskResponse(BaseModel):
 # ── Routes ──
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    llm = MODELS.get(req.model)
-    if not llm:
-        available = ", ".join(MODELS.keys())
+    try:
+        llm = get_llm(req.model)
+    except ValueError:
+        available = ", ".join(get_available_models())
         raise HTTPException(status_code=400, detail=f"不支持的模型: {req.model}，可用模型: {available}")
     messages = [
         SystemMessage(content="你是一个金融分析助手，回答简洁专业。"),
         HumanMessage(content=req.message),
     ]
-    result = llm.invoke(messages)
+    result = call_llm(llm, messages, caller="chat")
+    if not result.ok:
+        raise HTTPException(status_code=503, detail=f"LLM 服务暂时不可用: {result.error}")
     return ChatResponse(reply=result.content)
 
 
@@ -113,8 +99,9 @@ async def show_graph():
 # RAG 查询接口
 @app.post("/api/askRAG", response_model=AskResponse)
 async def ask_rag(req: AskRequest):
-    llm = MODELS.get(req.model)
-    if not llm:
+    try:
+        llm = get_llm(req.model)
+    except ValueError:
         raise HTTPException(400, detail=f"不支持的模型: {req.model}")
 
     sources = []
@@ -132,7 +119,9 @@ async def ask_rag(req: AskRequest):
         SystemMessage(content=system_prompt),
         HumanMessage(content=req.question),
     ]
-    result = llm.invoke(messages)
+    result = call_llm(llm, messages, caller="ask_rag")
+    if not result.ok:
+        raise HTTPException(status_code=503, detail=f"LLM 服务暂时不可用: {result.error}")
     return AskResponse(answer=result.content, sources=sources)
 
 
@@ -143,7 +132,23 @@ async def stats():
 
 @app.get("/api/health")
 async def health():
+    issues = []
+    # ChromaDB 连通性检测
+    try:
+        stats = get_stats()
+    except Exception as e:
+        issues.append(f"chromadb: {e}")
+    # API key 有效性检测（不调用，仅检查是否配置）
+    for model_name in get_available_models():
+        try:
+            llm = get_llm(model_name)
+            key = getattr(llm, "openai_api_key", "")
+            if not key or "placeholder" in str(key):
+                issues.append(f"{model_name}: API key 未配置")
+        except Exception as e:
+            issues.append(f"{model_name}: {e}")
     return {
-        "status": "ok",
-        "models": list(MODELS.keys()),
+        "status": "degraded" if issues else "ok",
+        "issues": issues if issues else None,
+        "models": get_available_models(),
     }

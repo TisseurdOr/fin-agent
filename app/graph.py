@@ -7,8 +7,8 @@ LangGraph 多 Agent 金融研报分析系统
 每个节点由 DeepSeek 驱动，通过不同的 system prompt 实现角色分工。
 State 在节点间传递，逐步丰富：raw_text → extracted_data → risk_flags → final_report
 """
-import os
 import json
+import logging
 from pathlib import Path
 from typing import TypedDict, Optional
 from dotenv import load_dotenv
@@ -16,18 +16,15 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from langgraph.graph import StateGraph, START, END
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from PyPDF2 import PdfReader
 
-DATA_DIR = Path(__file__).parent.parent / "data"
+from app.config import get_llm
+from app.llm_harness import call_llm
 
-llm = ChatOpenAI(
-    model="deepseek-v4-flash",
-    api_key=os.getenv("DEEPSEEK_API_KEY", "sk-placeholder"),
-    base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-    temperature=0.1,
-)
+logger = logging.getLogger(__name__)
+
+DATA_DIR = Path(__file__).parent.parent / "data"
 
 # ── State 定义 ──
 class AnalysisState(TypedDict):
@@ -67,20 +64,25 @@ def analyst_node(state: AnalysisState) -> dict:
     # 截断过长文本（DeepSeek 上下文足够，但控制成本）
     truncated = text[:8000] if len(text) > 8000 else text
 
-    resp = llm.invoke([
-        SystemMessage(content=ANALYST_PROMPT),
-        HumanMessage(content=f"研报内容：\n{truncated}"),
-    ])
+    result = call_llm(
+        get_llm("deepseek-v4-flash"),
+        [SystemMessage(content=ANALYST_PROMPT),
+         HumanMessage(content=f"研报内容：\n{truncated}")],
+        caller="analyst",
+    )
+
+    if not result.ok:
+        return {"extracted_data": {"error": f"LLM调用失败: {result.error}"}}
 
     try:
-        content = resp.content.strip()
+        content = result.content
         if "```" in content:
             content = content.split("```")[1]
             if content.startswith("json"):
                 content = content[4:]
         data = json.loads(content)
     except json.JSONDecodeError:
-        data = {"error": "解析失败", "raw_output": resp.content[:500]}
+        data = {"error": "解析失败", "raw_output": result.content[:500]}
 
     return {"extracted_data": data}
 
@@ -116,24 +118,32 @@ def risk_node(state: AnalysisState) -> dict:
             "risk_level": "high",
         }
 
-    resp = llm.invoke([
-        SystemMessage(content=RISK_PROMPT),
-        HumanMessage(content=f"分析师提取数据：\n{json.dumps(data, ensure_ascii=False, indent=2)}"),
-    ])
+    result = call_llm(
+        get_llm("deepseek-v4-flash"),
+        [SystemMessage(content=RISK_PROMPT),
+         HumanMessage(content=f"分析师提取数据：\n{json.dumps(data, ensure_ascii=False, indent=2)}")],
+        caller="risk",
+    )
+
+    if not result.ok:
+        return {
+            "risk_flags": [{"维度": "系统", "等级": "高", "描述": f"LLM调用失败: {result.error}"}],
+            "risk_level": "high",
+        }
 
     try:
-        content = resp.content.strip()
+        content = result.content
         if "```" in content:
             content = content.split("```")[1]
             if content.startswith("json"):
                 content = content[4:]
-        result = json.loads(content)
+        parsed = json.loads(content)
     except json.JSONDecodeError:
-        result = {"risk_flags": [], "risk_level": "unknown", "risk_summary": "风控分析解析失败"}
+        parsed = {"risk_flags": [], "risk_level": "unknown", "risk_summary": "风控分析解析失败"}
 
     return {
-        "risk_flags": result.get("risk_flags", []),
-        "risk_level": result.get("risk_level", "low"),
+        "risk_flags": parsed.get("risk_flags", []),
+        "risk_level": parsed.get("risk_level", "low"),
     }
 
 
@@ -172,12 +182,17 @@ def report_node(state: AnalysisState) -> dict:
 风险项：{json.dumps(risks, ensure_ascii=False, indent=2)}
 """
 
-    resp = llm.invoke([
-        SystemMessage(content=REPORT_PROMPT),
-        HumanMessage(content=input_text),
-    ])
+    result = call_llm(
+        get_llm("deepseek-v4-flash"),
+        [SystemMessage(content=REPORT_PROMPT),
+         HumanMessage(content=input_text)],
+        caller="report",
+    )
 
-    return {"final_report": resp.content}
+    if not result.ok:
+        return {"final_report": f"报告生成失败: {result.error}"}
+
+    return {"final_report": result.content}
 
 
 # ── 构建 Graph ──
@@ -213,6 +228,8 @@ def analyze_pdf(filename: str) -> dict:
     if not raw_text.strip():
         return {"error": "PDF 无法提取文本内容"}
 
+    logger.info("analyze_pdf start | file=%s text_len=%d", filename, len(raw_text))
+
     # 运行多 Agent 流水线
     result = graph.invoke({
         "pdf_filename": filename,
@@ -222,6 +239,13 @@ def analyze_pdf(filename: str) -> dict:
         "risk_level": None,
         "final_report": None,
     })
+
+    logger.info(
+        "analyze_pdf done | file=%s risk_level=%s report_len=%d",
+        filename,
+        result.get("risk_level", "?"),
+        len(result.get("final_report", "")),
+    )
 
     return {
         "pdf_filename": result["pdf_filename"],

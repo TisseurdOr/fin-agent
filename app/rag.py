@@ -1,4 +1,6 @@
 import os
+import json
+import logging
 from pathlib import Path
 from typing import List
 from dotenv import load_dotenv
@@ -9,9 +11,11 @@ from PyPDF2 import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.embeddings import Embeddings
 from langchain_community.vectorstores import Chroma
-from langchain_openai import ChatOpenAI
-from openai import OpenAI
-import json
+
+from app.config import get_llm, get_embedding_client
+from app.llm_harness import call_llm
+
+logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 CHROMA_DIR = Path(__file__).parent.parent / "chroma_db"
@@ -20,20 +24,19 @@ CHROMA_DIR = Path(__file__).parent.parent / "chroma_db"
 # 不用 LangChain 的 OpenAIEmbeddings（tiktoken 分词与 DashScope 不兼容），
 # 直接用 OpenAI client 封装，完全可控
 
-_dashscope_client = OpenAI(
-    api_key=os.getenv("DASHSCOPE_API_KEY", "sk-placeholder"),
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-)
-
 class DashScopeV4Embeddings(Embeddings):
-    """text-embedding-v4，OpenAI 兼容接口，1024 维"""
+    """text-embedding-v4，OpenAI 兼容接口，1024 维。
+
+    OpenAI 客户端通过 get_embedding_client() 延迟获取，不在 import 时构建。
+    """
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         all_embeddings = []
+        client = get_embedding_client()
         # v4 单次最多 10 条，分批调用
         for i in range(0, len(texts), 10):
             batch = texts[i : i + 10]
-            resp = _dashscope_client.embeddings.create(
+            resp = client.embeddings.create(
                 model="text-embedding-v4", input=batch,
             )
             all_embeddings.extend(d.embedding for d in resp.data)
@@ -52,13 +55,17 @@ splitter = RecursiveCharacterTextSplitter(
     separators=["\n\n", "\n", "。", "！", "？", "；", ".", "!", "?", ";", " "],
 )
 
-# ── LLM Reranker ──
-reranker_llm = ChatOpenAI(
-    model="deepseek-v4-flash",
-    api_key=os.getenv("DEEPSEEK_API_KEY", "sk-placeholder"),
-    base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-    temperature=0,
-)
+# ── LLM Reranker（延迟实例化）──
+_reranker = None
+
+
+def _get_reranker():
+    """延迟获取 reranker 的 ChatOpenAI 实例（缓存复用）"""
+    global _reranker
+    if _reranker is None:
+        _reranker = get_llm("deepseek-v4-flash")
+        _reranker.temperature = 0  # reranker 需要确定性输出
+    return _reranker
 
 RERANK_PROMPT = """你是一个信息检索专家。评估以下文档片段与用户问题的相关性。
 
@@ -83,10 +90,14 @@ def _rerank(question: str, passages: list[dict], top_n: int = 4) -> list[dict]:
         question=question, passages=candidates, top_n=top_n
     )
 
-    resp = reranker_llm.invoke(prompt)
+    result = call_llm(_get_reranker(), prompt, caller="rerank")
+    if not result.ok:
+        logger.warning("Rerank LLM failed, falling back to top_n: %s", result.error)
+        return passages[:top_n]
+
     try:
         # 提取 JSON（处理 LLM 可能包裹 ```json ... ``` 的情况）
-        text = resp.content.strip()
+        text = result.content
         if "```" in text:
             text = text.split("```")[1]
             if text.startswith("json"):
@@ -142,9 +153,17 @@ REWRITE_PROMPT = """你是一个搜索引擎优化专家。用户的自然语言
 
 def _rewrite_query(question: str) -> list[str]:
     """用 LLM 将用户问题改写为多个检索友好的版本"""
+    result = call_llm(
+        _get_reranker(),
+        REWRITE_PROMPT.format(question=question),
+        caller="rewrite",
+    )
+    if not result.ok:
+        logger.warning("Query rewrite LLM failed, using original question: %s", result.error)
+        return [question]
+
     try:
-        resp = reranker_llm.invoke(REWRITE_PROMPT.format(question=question))
-        text = resp.content.strip()
+        text = result.content
         if "```" in text:
             text = text.split("```")[1]
             if text.startswith("json"):
@@ -174,11 +193,15 @@ HYDE_PROMPT = """你是一个金融研究分析师。请针对以下问题，写
 
 def _hyde_generate(question: str) -> str:
     """生成假设文档，用于 HyDE 检索——假答案向量比问题向量更接近真实文档"""
-    try:
-        resp = reranker_llm.invoke(HYDE_PROMPT.format(question=question))
-        return resp.content.strip()
-    except Exception:
+    result = call_llm(
+        _get_reranker(),
+        HYDE_PROMPT.format(question=question),
+        caller="hyde",
+    )
+    if not result.ok:
+        logger.warning("HyDE generation failed, skipping: %s", result.error)
         return ""
+    return result.content
 
 
 # 主函数
